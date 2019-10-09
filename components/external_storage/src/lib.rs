@@ -21,6 +21,11 @@ pub use local::LocalStorage;
 mod noop;
 pub use noop::NoopStorage;
 
+#[cfg(feature = "s3")]
+mod s3;
+#[cfg(feature = "s3")]
+pub use s3::S3Storage;
+
 /// Create a new storage from the given url.
 pub fn create_storage(url: &str) -> io::Result<Arc<dyn ExternalStorage>> {
     let url = Url::parse(url).map_err(|e| {
@@ -36,6 +41,8 @@ pub fn create_storage(url: &str) -> io::Result<Arc<dyn ExternalStorage>> {
             LocalStorage::new(p).map(|s| Arc::new(s) as _)
         }
         NoopStorage::SCHEME => Ok(Arc::new(NoopStorage::new()) as _),
+        #[cfg(feature = "s3")]
+        S3Storage::SCHEME => S3Storage::new(url).map(|s| Arc::new(s) as _),
         other => {
             error!("unknown storage"; "scheme" => other);
             Err(io::Error::new(
