@@ -7,7 +7,7 @@ use std::sync::atomic::*;
 use std::sync::*;
 use std::time::*;
 
-use engine::DB;
+use engine::{CfName, IterOption, CF_DEFAULT, DATA_KEY_PREFIX_LEN, DB};
 use engine_rocks::RocksIOLimiter;
 use engine_traits::IOLimiter;
 use external_storage::*;
@@ -15,20 +15,23 @@ use futures::lazy;
 use futures::prelude::Future;
 use futures::sync::mpsc::*;
 use keys::Key;
+use keys::KvPair;
 use keys::TimeStamp;
 use kvproto::backup::*;
 use kvproto::kvrpcpb::{Context, IsolationLevel};
 use kvproto::metapb::*;
 use raft::StateRole;
 use tikv::raftstore::store::util::find_peer;
-use tikv::storage::kv::{Engine, RegionInfoProvider};
+use tikv::storage::kv::{Engine, RegionInfoProvider, ScanMode};
 use tikv::storage::txn::{EntryBatch, SnapshotStore, TxnEntryScanner, TxnEntryStore};
 use tikv::storage::Statistics;
+use tikv::storage::Storage;
 use tikv_util::timer::Timer;
 use tikv_util::worker::{Runnable, RunnableWithTimer};
 use tokio_threadpool::{Builder as ThreadPoolBuilder, ThreadPool};
 
 use crate::metrics::*;
+use crate::writer::BackupRawKVWriter;
 use crate::*;
 
 const WORKER_TAKE_RANGE: usize = 6;
@@ -46,6 +49,8 @@ pub struct Task {
     pub(crate) resp: UnboundedSender<BackupResponse>,
     concurrency: u32,
     cancel: Arc<AtomicBool>,
+    is_raw_kv: bool,
+    cf: String,
 }
 
 impl fmt::Display for Task {
@@ -60,6 +65,8 @@ impl fmt::Debug for Task {
             .field("end_ts", &self.end_ts)
             .field("start_key", &hex::encode_upper(&self.start_key))
             .field("end_key", &hex::encode_upper(&self.end_key))
+            .field("is_raw_kv", &self.is_raw_kv)
+            .field("cf", &self.cf)
             .finish()
     }
 }
@@ -98,6 +105,8 @@ impl Task {
                 storage,
                 concurrency: req.get_concurrency(),
                 cancel: cancel.clone(),
+                is_raw_kv: req.get_is_raw_kv(),
+                cf: req.get_cf(),
             },
             cancel,
         ))
@@ -115,11 +124,26 @@ pub struct BackupRange {
     end_key: Option<Key>,
     region: Region,
     leader: Peer,
+    is_raw_kv: bool,
+    cf: String,
 }
 
 impl BackupRange {
     /// Get entries from the scanner and save them to storage
-    fn backup<E: Engine>(
+    fn backup<E: Engine, W>(
+        &self,
+        writer: &mut W,
+        engine: &E,
+        backup_ts: TimeStamp,
+    ) -> Result<Statistics> {
+        if self.is_raw_kv {
+            return scan(writer, engine, backup_ts);
+        } else {
+            raw_scan(writer, engine, backup_ts)
+        }
+    }
+
+    fn scan<E: Engine>(
         &self,
         writer: &mut BackupWriter,
         engine: &E,
@@ -170,6 +194,66 @@ impl BackupRange {
         let stat = scanner.take_statistics();
         Ok(stat)
     }
+
+    fn raw_scan<E: Engine>(
+        &self,
+        writer: &mut BackupRawKVWriter,
+        engine: &E,
+        backup_ts: TimeStamp,
+    ) -> Result<Statistics> {
+        let mut ctx = Context::default();
+        ctx.set_region_id(self.region.get_id());
+        ctx.set_region_epoch(self.region.get_region_epoch().to_owned());
+        ctx.set_peer(self.leader.clone());
+        let snapshot = match engine.snapshot(&ctx) {
+            Ok(s) => s,
+            Err(e) => {
+                error!("backup snapshot failed"; "error" => ?e);
+                return Err(e.into());
+            }
+        };
+        let start = Instant::now();
+
+        let mut option = IterOption::default();
+        if let Some(end) = end_key {
+            option.set_upper_bound(end.as_encoded(), DATA_KEY_PREFIX_LEN);
+        }
+        let mut cursor =
+            snapshot.iter_cf(rawkv_cf(self.cf.as_str())?, option, ScanMode::Forward)?;
+
+        let mut statistics = Statistics::default();
+        let cfstatistics = statistics.mut_cf_statistics(self.cf.as_str());
+        if !cursor.seek(start_key, cfstatistics)? {
+            return Ok(vec![]);
+        }
+        let mut pairs = vec![];
+        let mut batch = vec![];
+        let limit = 1024;
+        loop {
+            while cursor.valid()? && batch.len() < limit {
+                batch.push(Ok((
+                    cursor.key(cfstatistics).to_owned(),
+                    cursor.value(cfstatistics).to_owned(),
+                )));
+                cursor.next(cfstatistics);
+            }
+            if batch.is_empty() {
+                break;
+            }
+            debug!("backup scan entries"; "len" => batch.len());
+            // Build sst files.
+            if let Err(e) = writer.write(&batch, true) {
+                error!("backup build sst failed"; "error" => ?e);
+                return Err(e);
+            }
+            batch.clear();
+        }
+
+        BACKUP_RANGE_HISTOGRAM_VEC
+            .with_label_values(&["raw_scan"])
+            .observe(start.elapsed().as_secs_f64());
+        cfstatistics.Ok(statistics)
+    }
 }
 
 type BackupRes = (Vec<File>, Statistics);
@@ -194,16 +278,27 @@ pub struct Progress<R: RegionInfoProvider> {
     end_key: Option<Key>,
     region_info: R,
     finished: bool,
+    is_raw_kv: bool,
+    cf: String,
 }
 
 impl<R: RegionInfoProvider> Progress<R> {
-    fn new(store_id: u64, next_start: Option<Key>, end_key: Option<Key>, region_info: R) -> Self {
+    fn new(
+        store_id: u64,
+        next_start: Option<Key>,
+        end_key: Option<Key>,
+        region_info: R,
+        is_raw_kv: bool,
+        cf: String,
+    ) -> Self {
         Progress {
             store_id,
             next_start,
             end_key,
             region_info,
             finished: Default::default(),
+            is_raw_kv: is_raw_kv,
+            cf: cf,
         }
     }
 
@@ -248,6 +343,8 @@ impl<R: RegionInfoProvider> Progress<R> {
                             end_key: ekey,
                             region: region.clone(),
                             leader,
+                            is_raw_kv,
+                            cf,
                         };
                         tx.send(backup_range).unwrap();
                         sended += 1;
@@ -370,6 +467,8 @@ impl<E: Engine, R: RegionInfoProvider> Endpoint<E, R> {
         // TODO: make it async.
         self.pool.borrow_mut().spawn(lazy(move || loop {
             let branges = prs.lock().unwrap().forward(WORKER_TAKE_RANGE);
+            let is_raw_kv = prs.lock().unwrap().is_raw_kv;
+            let cf = prs.lock().unwrap().cf;
             if branges.is_empty() {
                 return Ok(());
             }
@@ -387,27 +486,55 @@ impl<E: Engine, R: RegionInfoProvider> Endpoint<E, R> {
                 });
 
                 let name = backup_file_name(store_id, &brange.region, key);
-                let mut writer = match BackupWriter::new(db.clone(), &name, storage.limiter.clone())
-                {
-                    Ok(w) => w,
-                    Err(e) => {
-                        error!("backup writer failed"; "error" => ?e);
-                        return tx.send((brange, Err(e))).map_err(|_| ());
-                    }
-                };
-                let stat = match brange.backup(&mut writer, &engine, backup_ts) {
-                    Ok(s) => s,
-                    Err(e) => return tx.send((brange, Err(e))).map_err(|_| ()),
-                };
-                // Save sst files to storage.
-                let files = match writer.save(&storage.storage) {
-                    Ok(files) => files,
-                    Err(e) => {
-                        error!("backup save file failed"; "error" => ?e);
-                        return tx.send((brange, Err(e))).map_err(|_| ());
-                    }
-                };
-                let _ = tx.send((brange, Ok((files, stat)))).map_err(|_| ());
+                if is_raw_kv {
+                    let mut writer = match BackupRawKVWriter::new(
+                        db.clone(),
+                        &name,
+                        &cf,
+                        storage.limiter.clone(),
+                    ) {
+                        Ok(w) => w,
+                        Err(e) => {
+                            error!("backup writer failed"; "error" => ?e);
+                            return tx.send((brange, Err(e))).map_err(|_| ());
+                        }
+                    };
+                    let stat = match brange.backup(&mut writer, &engine, backup_ts) {
+                        Ok(s) => s,
+                        Err(e) => return tx.send((brange, Err(e))).map_err(|_| ()),
+                    };
+                    // Save sst files to storage.
+                    let files = match writer.save(&storage.storage) {
+                        Ok(files) => files,
+                        Err(e) => {
+                            error!("backup save file failed"; "error" => ?e);
+                            return tx.send((brange, Err(e))).map_err(|_| ());
+                        }
+                    };
+                    let _ = tx.send((brange, Ok((files, stat)))).map_err(|_| ());
+                } else {
+                    let mut writer =
+                        match BackupWriter::new(db.clone(), &name, storage.limiter.clone()) {
+                            Ok(w) => w,
+                            Err(e) => {
+                                error!("backup writer failed"; "error" => ?e);
+                                return tx.send((brange, Err(e))).map_err(|_| ());
+                            }
+                        };
+                    let stat = match brange.backup(&mut writer, &engine, backup_ts) {
+                        Ok(s) => s,
+                        Err(e) => return tx.send((brange, Err(e))).map_err(|_| ()),
+                    };
+                    // Save sst files to storage.
+                    let files = match writer.save(&storage.storage) {
+                        Ok(files) => files,
+                        Err(e) => {
+                            error!("backup save file failed"; "error" => ?e);
+                            return tx.send((brange, Err(e))).map_err(|_| ());
+                        }
+                    };
+                    let _ = tx.send((brange, Ok((files, stat)))).map_err(|_| ());
+                }
             }
         }));
     }
@@ -431,6 +558,8 @@ impl<E: Engine, R: RegionInfoProvider> Endpoint<E, R> {
             start_key,
             end_key,
             self.region_info.clone(),
+            task.is_raw_kv,
+            task.cf,
         )));
         let concurrency = cmp::max(1, task.concurrency) as usize;
         self.pool.borrow_mut().adjust_with(concurrency);
@@ -699,11 +828,14 @@ pub mod tests {
                 } else {
                     Some(Key::from_raw(end_key))
                 };
+                let cf = CF_DEFAULT;
                 let mut prs = Progress::new(
                     endpoint.store_id,
                     start_key,
                     end_key,
                     endpoint.region_info.clone(),
+                    false,
+                    cf.to_string(),
                 );
 
                 let mut ranges = Vec::with_capacity(expect.len());
@@ -749,6 +881,7 @@ pub mod tests {
                     limiter: None,
                 };
                 let (tx, rx) = unbounded();
+                let cf = CF_DEFAULT;
                 let task = Task {
                     start_key: start_key.to_vec(),
                     end_key: end_key.to_vec(),
@@ -758,6 +891,8 @@ pub mod tests {
                     storage,
                     concurrency: 4,
                     cancel: Arc::default(),
+                    is_raw_kv: false,
+                    cf: cf.to_string(),
                 };
                 endpoint.handle_backup_task(task);
                 let resps: Vec<_> = rx.collect().wait().unwrap();
