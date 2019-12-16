@@ -9,11 +9,11 @@ use engine_rocks::{RocksEngine, RocksSstWriter, RocksSstWriterBuilder};
 use engine_traits::LimitReader;
 use engine_traits::{SstWriter, SstWriterBuilder};
 use external_storage::ExternalStorage;
-use keys::KvPair;
 use kvproto::backup::File;
 use tikv::coprocessor::checksum_crc64_xor;
 use tikv::storage::txn::TxnEntry;
 use tikv_util::{self, box_err};
+use txn_types::KvPair;
 
 use crate::metrics::*;
 use crate::{Error, Result};
@@ -217,7 +217,7 @@ impl BackupRawKVWriter {
     ) -> Result<BackupRawKVWriter> {
         let write = RocksSstWriterBuilder::new()
             .set_in_memory(true)
-            .set_cf(cf)
+            .set_cf(super::endpoint::rawkv_cf(cf)?)
             .set_db(RocksEngine::from_ref(&db))
             .build(name)?;
         Ok(BackupRawKVWriter {
@@ -228,41 +228,19 @@ impl BackupRawKVWriter {
         })
     }
 
-    /// Write KvPair to buffered SST files.
-    pub fn write(&mut self, kvPairs: Vec<Result<KvPair>>, need_checksum: bool) -> Result<()> {
-        for kvPair in kvPairs {
-            let mut value_in_default = false;
-            let (k, v) = match kvPair {
+    /// Write Kv_pair to buffered SST files.
+    pub fn write(&mut self, kv_pairs: &[Result<KvPair>], need_checksum: bool) -> Result<()> {
+        for kv_pair in kv_pairs {
+            let (k, v) = match kv_pair {
                 Ok(s) => s,
                 Err(e) => {
                     error!("write raw kv"; "error" => ?e);
-                    return Err(e.into());
+                    return Err(Error::Other("occur an error when written raw kv".into()));
                 }
             };
             assert!(!k.is_empty());
-            self.write.writer(&k, &v)?;
+            self.write.write(&k, &v)?;
             self.write.update_raw_with(&k, &v, need_checksum);
-
-            let mut value_in_default = false;
-            match &e {
-                TxnEntry::Commit { default, write } => {
-                    // Default may be empty if value is small.
-                    if !default.0.is_empty() {
-                        self.default.write(&default.0, &default.1)?;
-                        value_in_default = true;
-                    }
-                    assert!(!write.0.is_empty());
-                    self.write.write(&write.0, &write.1)?;
-                }
-                TxnEntry::Prewrite { .. } => {
-                    return Err(Error::Other("prewrite is not supported".into()));
-                }
-            }
-            if value_in_default {
-                self.default.update_with(e, need_checksum)?;
-            } else {
-                self.write.update_with(e, need_checksum)?;
-            }
         }
         Ok(())
     }
@@ -276,7 +254,7 @@ impl BackupRawKVWriter {
             // Save default cf contents.
             let file = self.write.save_and_build_file(
                 &self.name,
-                &self.cf,
+                super::endpoint::rawkv_cf(&self.cf)?,
                 &mut buf,
                 self.limiter.clone(),
                 storage,

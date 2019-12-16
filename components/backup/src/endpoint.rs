@@ -1,34 +1,31 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::cell::RefCell;
-use std::cmp;
-use std::fmt;
-use std::sync::atomic::*;
-use std::sync::*;
-use std::time::*;
-
-use engine::{CfName, IterOption, CF_DEFAULT, DATA_KEY_PREFIX_LEN, DB};
+use engine::{CfName, IterOption, CF_DEFAULT, DATA_CFS, DATA_KEY_PREFIX_LEN, DB};
 use engine_rocks::RocksIOLimiter;
 use engine_traits::IOLimiter;
 use external_storage::*;
 use futures::lazy;
 use futures::prelude::Future;
 use futures::sync::mpsc::*;
-use keys::Key;
-use keys::KvPair;
-use keys::TimeStamp;
 use kvproto::backup::*;
 use kvproto::kvrpcpb::{Context, IsolationLevel};
 use kvproto::metapb::*;
 use raft::StateRole;
+use std::cell::RefCell;
+use std::cmp;
+use std::fmt;
+use std::sync::atomic::*;
+use std::sync::*;
+use std::time::*;
 use tikv::raftstore::store::util::find_peer;
-use tikv::storage::kv::{Engine, RegionInfoProvider, ScanMode};
+use tikv::storage::kv::{Engine, RegionInfoProvider, ScanMode, Snapshot};
 use tikv::storage::txn::{EntryBatch, SnapshotStore, TxnEntryScanner, TxnEntryStore};
 use tikv::storage::Statistics;
-use tikv::storage::Storage;
+use tikv::storage::{Error as StorageError, ErrorInner as StorageErrorInner};
 use tikv_util::timer::Timer;
 use tikv_util::worker::{Runnable, RunnableWithTimer};
 use tokio_threadpool::{Builder as ThreadPoolBuilder, ThreadPool};
+use txn_types::{Key, TimeStamp};
 
 use crate::metrics::*;
 use crate::writer::BackupRawKVWriter;
@@ -106,7 +103,7 @@ impl Task {
                 concurrency: req.get_concurrency(),
                 cancel: cancel.clone(),
                 is_raw_kv: req.get_is_raw_kv(),
-                cf: req.get_cf(),
+                cf: req.get_cf().to_string(),
             },
             cancel,
         ))
@@ -130,20 +127,7 @@ pub struct BackupRange {
 
 impl BackupRange {
     /// Get entries from the scanner and save them to storage
-    fn backup<E: Engine, W>(
-        &self,
-        writer: &mut W,
-        engine: &E,
-        backup_ts: TimeStamp,
-    ) -> Result<Statistics> {
-        if self.is_raw_kv {
-            return scan(writer, engine, backup_ts);
-        } else {
-            raw_scan(writer, engine, backup_ts)
-        }
-    }
-
-    fn scan<E: Engine>(
+    fn backup<E: Engine>(
         &self,
         writer: &mut BackupWriter,
         engine: &E,
@@ -195,12 +179,13 @@ impl BackupRange {
         Ok(stat)
     }
 
-    fn raw_scan<E: Engine>(
+    fn backup_raw<E: Engine>(
         &self,
         writer: &mut BackupRawKVWriter,
         engine: &E,
         backup_ts: TimeStamp,
     ) -> Result<Statistics> {
+        let _ = backup_ts;
         let mut ctx = Context::default();
         ctx.set_region_id(self.region.get_id());
         ctx.set_region_epoch(self.region.get_region_epoch().to_owned());
@@ -215,20 +200,30 @@ impl BackupRange {
         let start = Instant::now();
 
         let mut option = IterOption::default();
-        if let Some(end) = end_key {
+        if let Some(end) = self.end_key.clone() {
             option.set_upper_bound(end.as_encoded(), DATA_KEY_PREFIX_LEN);
         }
-        let mut cursor =
-            snapshot.iter_cf(rawkv_cf(self.cf.as_str())?, option, ScanMode::Forward)?;
-
+        /*
+        let mut cursor = snapshot.iter_cf(
+            Storage::<Engine, LockManager>::rawkv_cf(&self.cf)?,
+            option,
+            ScanMode::Forward,
+        )?;
+        */
+        let mut cursor = snapshot.iter_cf(rawkv_cf(&self.cf)?, option, ScanMode::Forward)?;
+        let raw: Vec<u8> = (0..0).collect();
+        let empty_key = Key::from_raw(&raw);
+        let s_key = match self.start_key.clone() {
+            Some(s) => s,
+            None => empty_key,
+        };
         let mut statistics = Statistics::default();
-        let cfstatistics = statistics.mut_cf_statistics(self.cf.as_str());
-        if !cursor.seek(start_key, cfstatistics)? {
-            return Ok(vec![]);
+        let cfstatistics = statistics.mut_cf_statistics(&self.cf);
+        if !cursor.seek(&s_key, cfstatistics)? {
+            return Ok(statistics);
         }
-        let mut pairs = vec![];
-        let mut batch = vec![];
         let limit = 1024;
+        let mut batch = vec![];
         loop {
             while cursor.valid()? && batch.len() < limit {
                 batch.push(Ok((
@@ -252,7 +247,7 @@ impl BackupRange {
         BACKUP_RANGE_HISTOGRAM_VEC
             .with_label_values(&["raw_scan"])
             .observe(start.elapsed().as_secs_f64());
-        cfstatistics.Ok(statistics)
+        Ok(statistics)
     }
 }
 
@@ -297,8 +292,8 @@ impl<R: RegionInfoProvider> Progress<R> {
             end_key,
             region_info,
             finished: Default::default(),
-            is_raw_kv: is_raw_kv,
-            cf: cf,
+            is_raw_kv,
+            cf,
         }
     }
 
@@ -318,6 +313,8 @@ impl<R: RegionInfoProvider> Progress<R> {
 
         let start_key = self.next_start.clone();
         let end_key = self.end_key.clone();
+        let raw_kv = self.is_raw_kv;
+        let cf_name = self.cf.clone();
         let res = self.region_info.seek_region(
             &start_key_,
             Box::new(move |iter| {
@@ -343,8 +340,8 @@ impl<R: RegionInfoProvider> Progress<R> {
                             end_key: ekey,
                             region: region.clone(),
                             leader,
-                            is_raw_kv,
-                            cf,
+                            is_raw_kv: raw_kv,
+                            cf: cf_name.clone(),
                         };
                         tx.send(backup_range).unwrap();
                         sended += 1;
@@ -468,7 +465,7 @@ impl<E: Engine, R: RegionInfoProvider> Endpoint<E, R> {
         self.pool.borrow_mut().spawn(lazy(move || loop {
             let branges = prs.lock().unwrap().forward(WORKER_TAKE_RANGE);
             let is_raw_kv = prs.lock().unwrap().is_raw_kv;
-            let cf = prs.lock().unwrap().cf;
+            let cf = prs.lock().unwrap().cf.clone();
             if branges.is_empty() {
                 return Ok(());
             }
@@ -499,7 +496,7 @@ impl<E: Engine, R: RegionInfoProvider> Endpoint<E, R> {
                             return tx.send((brange, Err(e))).map_err(|_| ());
                         }
                     };
-                    let stat = match brange.backup(&mut writer, &engine, backup_ts) {
+                    let stat = match brange.backup_raw(&mut writer, &engine, backup_ts) {
                         Ok(s) => s,
                         Err(e) => return tx.send((brange, Err(e))).map_err(|_| ()),
                     };
@@ -716,6 +713,21 @@ fn backup_file_name(store_id: u64, region: &Region, key: Option<String>) -> Stri
         ),
     }
 }
+pub fn rawkv_cf(cfname: &str) -> Result<CfName> {
+    if cfname.is_empty() {
+        return Ok(CF_DEFAULT);
+    }
+    for c in DATA_CFS {
+        if cfname == *c {
+            return Ok(c);
+        }
+    }
+    let mut info = String::from("invalid cf name ");
+    info.push_str(cfname);
+    Err(errors::Error::Storage(<StorageError>::from(
+        StorageErrorInner::InvalidCf(info),
+    )))
+}
 
 #[cfg(test)]
 pub mod tests {
@@ -731,9 +743,9 @@ pub mod tests {
     use tikv::raftstore::store::util::new_peer;
     use tikv::storage::kv::Result as EngineResult;
     use tikv::storage::mvcc::tests::*;
-    use tikv::storage::SHORT_VALUE_MAX_LEN;
     use tikv::storage::{RocksEngine, TestEngineBuilder};
     use tikv_util::time::Instant;
+    use txn_types::SHORT_VALUE_MAX_LEN;
 
     #[derive(Clone)]
     pub struct MockRegionInfoProvider {
